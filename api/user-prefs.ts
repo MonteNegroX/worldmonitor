@@ -27,6 +27,7 @@ import {
 import { ConvexHttpClient } from 'convex/browser';
 import { validateBearerToken } from '../server/auth-session';
 import { checkScopedRateLimit } from '../server/_shared/rate-limit';
+import { isPreferenceVariant } from '../shared/cloud-preferences-contract';
 
 export const USER_PREFS_WRITE_RATE_SCOPE = 'user-prefs-write';
 // Keep in lockstep with convex/constants.ts; tests/user-prefs-rate-limit.test.mts
@@ -62,6 +63,23 @@ function createDefaultUserPrefsDeps(): UserPrefsDeps {
 }
 
 let userPrefsDeps: UserPrefsDeps = createDefaultUserPrefsDeps();
+
+/**
+ * The Two-Verifier Seam invariant (#7097, CONCEPTS.md): a token the edge
+ * accepted only inside its bounded clockTolerance can age past Convex's own
+ * leeway and be refused there. That 401 is expected near-expiry traffic, not
+ * Clerk-vs-Convex auth drift, and it is deliberately kept OUT of the
+ * WORLDMONITOR-QK (convex_auth_drift) capture by this predicate rather than
+ * by any edge 401 — the `warning`-level downgrade on that bucket only holds
+ * while QK contains genuine drift. One predicate for both the GET and POST
+ * branches so the two halves of the invariant cannot drift apart (#7140).
+ */
+function isExpectedNearExpiry401(
+  kind: string,
+  session: { acceptedWithinClockTolerance?: true },
+): boolean {
+  return kind === 'UNAUTHENTICATED' && session.acceptedWithinClockTolerance === true;
+}
 
 export function __setUserPrefsDepsForTests(overrides: Partial<UserPrefsDeps> | null): void {
   userPrefsDeps = overrides
@@ -204,6 +222,9 @@ export default async function handler(
   if (req.method === 'GET') {
     const url = new URL(req.url);
     const variant = url.searchParams.get('variant') ?? 'full';
+    if (!isPreferenceVariant(variant)) {
+      return jsonResponse({ error: 'INVALID_VARIANT' }, 400, cors);
+    }
 
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -258,7 +279,7 @@ export default async function handler(
       // Re-archiving as anything that cannot reopen silently deletes the
       // only escalation path this `warning` level leaves.
       if (kind === 'UNAUTHENTICATED') {
-        if (session.acceptedWithinClockTolerance) {
+        if (isExpectedNearExpiry401(kind, session)) {
           console.warn(
             '[user-prefs] GET 401 for token accepted within edge clock tolerance (expected near-expiry, not drift)',
           );
@@ -310,6 +331,9 @@ export default async function handler(
     typeof body.expectedSyncVersion !== 'number'
   ) {
     return finish(jsonResponse({ error: 'MISSING_FIELDS' }, 400, cors));
+  }
+  if (!isPreferenceVariant(body.variant)) {
+    return finish(jsonResponse({ error: 'INVALID_VARIANT' }, 400, cors));
   }
 
   try {
@@ -392,7 +416,7 @@ export default async function handler(
       // bucket with no auth regression at all. That is what the May–July 2026
       // 13.6x ramp was; see
       // docs/solutions/integration-issues/convex-auth-drift-ramp-was-stacked-clerk-token-cache.md.
-      if (session.acceptedWithinClockTolerance) {
+      if (isExpectedNearExpiry401(kind, session)) {
         console.warn(
           '[user-prefs] POST 401 for token accepted within edge clock tolerance (expected near-expiry, not drift)',
         );

@@ -98,7 +98,7 @@ function classifyMcpInboundHost(hostname: string): McpToolExecutionContext['inbo
   if (hostname === 'www.worldmonitor.app') return 'www';
   if (VARIANT_HOSTS.has(hostname)) return 'variant';
   if (hostname.endsWith('.worldmonitor.app')) return 'worldmonitor_subdomain';
-  if (hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1') return 'local';
+  if (isLoopbackHostname(hostname)) return 'local';
   if (hostname.endsWith('.vercel.app')) return 'vercel_preview';
   return 'other';
 }
@@ -126,11 +126,11 @@ export function createMcpToolExecutionContext(requestUrl: string): McpToolExecut
 }
 
 function isLoopbackHostname(hostname: string): boolean {
-  return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1';
+  return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1' || hostname === '[::1]';
 }
 
 export function buildMcpDownstreamHeaders(
-  targetOrigin: string,
+  targetUrl: string,
   execution: McpToolExecutionContext | undefined,
   headers: Record<string, string>,
 ): Record<string, string> {
@@ -138,7 +138,7 @@ export function buildMcpDownstreamHeaders(
   let target: URL;
   let expected: URL;
   try {
-    target = new URL(targetOrigin);
+    target = new URL(targetUrl);
     expected = new URL(execution.downstreamOrigin);
   } catch {
     return headers;
@@ -147,6 +147,20 @@ export function buildMcpDownstreamHeaders(
   const token = process.env.LOCAL_API_TOKEN?.trim();
   if (!token) return headers;
   return { ...headers, 'X-WorldMonitor-Local-Token': token };
+}
+
+export function fetchMcpDownstream(
+  url: string,
+  init: RequestInit & { headers: Record<string, string> },
+  execution: McpToolExecutionContext | undefined,
+): Promise<Response> {
+  const headers = buildMcpDownstreamHeaders(url, execution, init.headers);
+  return globalThis.fetch(url, {
+    ...init,
+    headers,
+    // Custom transport headers survive cross-origin redirects in fetch.
+    ...(new Headers(headers).has('X-WorldMonitor-Local-Token') ? { redirect: 'error' as const } : {}),
+  });
 }
 
 function contentType(response: ToolFetchResponse): string {
@@ -391,6 +405,36 @@ export class BothSourcesFailedError extends Error {
   }
 }
 
+/** Sentry silently truncates a tag value past this; truncate on a field boundary ourselves. */
+const MAX_VIOLATION_FIELDS_TAG_LEN = 200;
+
+/**
+ * Name the fields a proto/sebuf 400 rejected, as a searchable Sentry tag.
+ *
+ * `RpcValidationError` already hands its violations to the caller
+ * (`error.data.violations`), but the Sentry event carried only
+ * `<operation> HTTP 400` — so an issue like WORLDMONITOR-10R could not name its
+ * failing field from Sentry alone, and the country fix in #7170 could be
+ * neither confirmed nor refuted against it. Fields only: the descriptions are
+ * long, and `field` is the part that groups.
+ *
+ * Safe to expose by construction — `parseSafeRpcViolations` (billing-denial.ts)
+ * already bounds the list to 8 and admits a field only if it matches
+ * `^[A-Za-z_][A-Za-z0-9_.]{0,63}$`, so no untrusted text reaches this tag. The
+ * length bound is belt-and-braces for that 8 x 64 worst case.
+ */
+function violationFieldsTag(violations: readonly { field: string }[]): string {
+  const joined: string[] = [];
+  let len = 0;
+  for (const { field } of violations) {
+    const cost = field.length + (joined.length > 0 ? 1 : 0);
+    if (len + cost > MAX_VIOLATION_FIELDS_TAG_LEN) break;
+    joined.push(field);
+    len += cost;
+  }
+  return joined.join(',');
+}
+
 export function downstreamErrorTags(
   error: unknown,
 ): Record<string, string> {
@@ -408,6 +452,7 @@ export function downstreamErrorTags(
       downstream_status: String(error.status),
       downstream_error_code: 'rpc_validation',
       downstream_response_marker: 'json_error',
+      downstream_violation_fields: violationFieldsTag(error.violations),
     };
   }
   if (error instanceof ToolFetchError) {

@@ -49,7 +49,7 @@ function runGuardProbe(expectBuiltOutput) {
     if (expectBuiltOutput) env.WM_EXPECT_BUILT_OUTPUT = '1';
     else delete env.WM_EXPECT_BUILT_OUTPUT;
 
-    const result = spawnSync(process.execPath, ['--test', probePath], {
+    const result = spawnSync(process.execPath, ['--test', '--test-reporter=tap', probePath], {
       cwd: repoRoot,
       encoding: 'utf8',
       env,
@@ -175,6 +175,28 @@ describe('built-output guard contract', () => {
       /guardBuiltOutput\(PRO_BUILT_MARKER/,
       'guardProBuiltOutput must ask the shared primitive about the /pro marker',
     );
+
+    const sentrySource = readFileSync(resolve(repoRoot, 'tests/pro-sentry-chunk.test.mjs'), 'utf8');
+    assert.match(
+      sentrySource,
+      /from '\.\/_lib\/built-output-guard\.mjs'/,
+      'the pro Sentry chunk suite must use the shared built-output primitive',
+    );
+    assert.match(
+      sentrySource,
+      /skip: shouldSkipBuiltOutput\(ASSETS_DIR\)/,
+      'the pro Sentry chunk suite must skip specifically when public/pro/assets is absent',
+    );
+    assert.match(
+      sentrySource,
+      /guardBuiltOutput\(ASSETS_DIR, undefined, REBUILD_HINT\)/,
+      'the pro Sentry chunk suite must fail closed on the same assets path when CI expects built output',
+    );
+    assert.match(
+      sentrySource,
+      /Run `npm run build:pro` first/,
+      'the pro Sentry chunk failure must name the /pro build command',
+    );
   });
 
   it('keeps the /pro build-output existence check in the freshness workflow', () => {
@@ -218,10 +240,22 @@ describe('built-output guard contract', () => {
   it('fails the built-output suite when CI expects output but it is missing', () => {
     const result = runGuardProbe(true);
 
+    // CI uses Node 24: a guard failure must fail the process as well as the
+    // suite. The probe selects TAP explicitly because Node 24 defaults to spec.
     assert.notEqual(result.status, 0, result.output);
+    assert.match(
+      result.output,
+      /^not ok 1 - built-output guard probe$/m,
+      `the probe suite must be reported as failed:\n${result.output}`,
+    );
+    assert.match(
+      result.output,
+      /missing but WM_EXPECT_BUILT_OUTPUT=1 indicates CI expected a build/,
+      `the failure must come from the guard, not an unrelated crash:\n${result.output}`,
+    );
+    assert.notEqual(result.status, null, 'the probe process must not have been killed by a signal');
     assert.equal(result.loaded, true, 'the probe module should load');
     assert.equal(result.suite, true, 'the suite callback should run when CI expects built output');
     assert.equal(result.assertion, false, 'the assertion must not run after the guard fails');
-    assert.match(result.output, /WM_EXPECT_BUILT_OUTPUT=1/);
   });
 });

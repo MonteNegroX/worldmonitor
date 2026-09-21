@@ -2,6 +2,10 @@ import { strict as assert } from 'node:assert';
 import test from 'node:test';
 import handler from './bootstrap.js';
 import { issueSessionToken } from './_session.js';
+import {
+  assertPublicBootstrapCorsHeaders,
+  assertPublicBootstrapSharedCacheHeaders,
+} from '../tests/helpers/public-bootstrap-contract.mjs';
 
 const ENTERPRISE_KEY = 'enterprise-bootstrap-test-key';
 const USER_KEY = 'wm_0123456789abcdef0123456789abcdef01234567';
@@ -198,21 +202,20 @@ function makePublicTierBootstrapRequest(tier = 'fast', headers = {}) {
   });
 }
 
+// Both delegate to tests/helpers/public-bootstrap-contract.mjs, which
+// tests/cors-preflight-live.test.mjs runs against a DEPLOYED URL. Keeping one
+// definition is the point: #7308 shipped because these assertions passed against
+// handler() while the edge served a different shape to real browsers.
 function assertSharedCacheHeaders(resp) {
-  // Tier responses intentionally avoid public/s-maxage in Cache-Control (CF in
-  // front of api.worldmonitor.app would mispin ACAO) and shield via Vercel's
-  // CDN-Cache-Control instead.
-  assert.ok(resp.headers.get('cdn-cache-control'));
-  assert.match(resp.headers.get('cdn-cache-control') || '', /\b(public|s-maxage)\b/i);
+  assertPublicBootstrapSharedCacheHeaders({ assert, resp });
 }
 
 function assertPublicCorsHeaders(resp) {
-  // Public seed payload → ACAO:* with no Vary: Origin and no credentials, so the
-  // shared CDN stores one entry per URL and no origin can pin an echoed ACAO.
-  assert.equal(resp.headers.get('access-control-allow-origin'), '*');
-  assert.equal(resp.headers.get('access-control-allow-credentials'), null);
+  assertPublicBootstrapCorsHeaders({ assert, resp });
+  // Tighter than the shared contract can be: this response is the handler's own
+  // output, with no platform-appended `Vary: accept-encoding` yet, so no Vary
+  // at all is the correct expectation here.
   assert.equal(resp.headers.get('vary'), null);
-  assert.equal(resp.headers.get('timing-allow-origin'), '*');
 }
 
 function assertNonSharedCacheHeaders(resp) {
@@ -443,7 +446,7 @@ test('over-limit wm_ user key returns non-cacheable 429 before Convex validation
 
 test('wm_ credential outside the supported header fallback never leaks the gateway sentinel', async () => {
   await withMockedBootstrapAuth({ entitlement: activeApiEntitlement() }, async () => {
-    const resp = await handler(makeBootstrapRequest({ Cookie: `wm-pro-key=${USER_KEY}` }));
+    const resp = await handler(makeBootstrapRequest({ Cookie: `__Host-wm-pro-key=${USER_KEY}` }));
     const body = await resp.json();
 
     assert.equal(resp.status, 401);
@@ -916,6 +919,17 @@ test('public on-demand URL does not widen into a CDN-amplification vector', asyn
       const resp = await handler(makePublicOnDemandRequest(keys));
       assert.equal(resp.status, 401, `keys=${keys} must not qualify for the public path`);
       assert.equal(resp.headers.get('cache-control'), 'no-store', `keys=${keys} must stay no-store`);
+    }
+  });
+});
+
+test('protected tester cookie names keep implicit weather bootstrap off the public cache path', async () => {
+  await withMockedBootstrapAuth({ entitlement: activeApiEntitlement() }, async () => {
+    for (const name of ['__Host-wm-pro-key', '__Host-wm-widget-key']) {
+      const response = await handler(makeWeatherBootstrapRequest({ Cookie: `${name}=invalid-key` }));
+      assert.equal(response.status, 401, name);
+      assert.equal(response.headers.get('cache-control'), 'no-store', name);
+      assert.equal(response.headers.get('cdn-cache-control'), null, name);
     }
   });
 });

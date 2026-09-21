@@ -94,6 +94,32 @@ export interface DigestCoverage {
   droppedUndated: number;
   droppedFreshness: number;
   droppedCategoryCap: number;
+  servedStale: boolean;
+  staleAgeSeconds: number;
+  staleReason: string;
+}
+
+export interface ListCountryHeadlinesRequest {
+  countryCodes: string[];
+}
+
+export interface ListCountryHeadlinesResponse {
+  countries: Record<string, CountryHeadlineBucket>;
+  state: string;
+  feedTotal: number;
+  feedCached: number;
+  readAt: string;
+}
+
+export interface CountryHeadlineBucket {
+  items: CountryHeadline[];
+}
+
+export interface CountryHeadline {
+  source: string;
+  title: string;
+  link: string;
+  publishedAt: number;
 }
 
 export type StoryPhase = "STORY_PHASE_UNSPECIFIED" | "STORY_PHASE_BREAKING" | "STORY_PHASE_DEVELOPING" | "STORY_PHASE_SUSTAINED" | "STORY_PHASE_FADING";
@@ -223,6 +249,31 @@ export class NewsServiceClient {
     }
 
     return await resp.json() as ListFeedDigestResponse;
+  }
+
+  async listCountryHeadlines(req: ListCountryHeadlinesRequest, options?: NewsServiceCallOptions): Promise<ListCountryHeadlinesResponse> {
+    let path = "/api/news/v1/list-country-headlines";
+    const params = new URLSearchParams();
+    if (req.countryCodes && req.countryCodes.length > 0) req.countryCodes.forEach(v => params.append("country_codes", v));
+    const url = this.baseURL + path + (params.toString() ? "?" + params.toString() : "");
+
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      ...this.defaultHeaders,
+      ...options?.headers,
+    };
+
+    const resp = await this.fetchFn(url, {
+      method: "GET",
+      headers,
+      signal: options?.signal,
+    });
+
+    if (!resp.ok) {
+      return this.handleError(resp);
+    }
+
+    return await resp.json() as ListCountryHeadlinesResponse;
   }
 
   private async handleError(resp: Response): Promise<never> {

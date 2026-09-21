@@ -58,6 +58,7 @@ import {
   shouldExitNonZero as shouldExitOnBriefFailures,
 } from './lib/brief-compose.mjs';
 import {
+  carouselUrlsFrom,
   digestWindowStartMs,
   pickWinningCandidateWithPool,
   readTimeAgeCutoffMs,
@@ -123,7 +124,8 @@ const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN ?? '';
 const CONVEX_SITE_URL =
   process.env.CONVEX_SITE_URL ??
   (process.env.CONVEX_URL ?? '').replace('.convex.cloud', '.convex.site');
-const RELAY_SECRET = process.env.RELAY_SHARED_SECRET ?? '';
+const RELAY_SECRET = process.env.CONVEX_NOTIFICATION_RELAY_SECRET ?? '';
+const ANALYST_RELAY_SECRET = process.env.RELAY_SHARED_SECRET ?? '';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN ?? '';
 const RESEND_API_KEY = process.env.RESEND_API_KEY ?? '';
 // Brief/digest is an editorial daily read, not an incident alarm — route it
@@ -152,7 +154,7 @@ if (!UPSTASH_URL || !UPSTASH_TOKEN) {
   process.exit(1);
 }
 if (!CONVEX_SITE_URL || !RELAY_SECRET) {
-  console.error('[digest] CONVEX_SITE_URL / RELAY_SHARED_SECRET not set');
+  console.error('[digest] CONVEX_SITE_URL / CONVEX_NOTIFICATION_RELAY_SECRET not set');
   process.exit(1);
 }
 
@@ -264,7 +266,7 @@ function normalizeForDescriptionEquality(s) {
  * (See feedback_gate_on_ground_truth_not_configured_state.md.)
  */
 async function callAnalystWhyMatters(story) {
-  if (!RELAY_SECRET) return null;
+  if (!ANALYST_RELAY_SECRET) return null;
   // Forward a trimmed story payload so the endpoint only sees the
   // fields it validates. `description` is NEW for prompt-v2 — when
   // upstream has a real one (falls back to headline via
@@ -293,7 +295,7 @@ async function callAnalystWhyMatters(story) {
     const resp = await fetch(BRIEF_WHY_MATTERS_ENDPOINT_URL, {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${RELAY_SECRET}`,
+        Authorization: `Bearer ${ANALYST_RELAY_SECRET}`,
         'Content-Type': 'application/json',
         // Explicit UA — Node undici's default is short/empty enough to
         // trip middleware.ts's "No user-agent or suspiciously short"
@@ -1180,7 +1182,6 @@ function formatDigestHtml(stories, nowMs) {
       <div style="margin-bottom: 12px;">
         <a href="https://x.com/worldmonitorapp" style="color: #555; text-decoration: none; font-size: 11px; margin: 0 10px;">X / Twitter</a>
         <a href="https://github.com/koala73/worldmonitor" style="color: #555; text-decoration: none; font-size: 11px; margin: 0 10px;">GitHub</a>
-        <a href="https://discord.gg/re63kWKxaz" style="color: #555; text-decoration: none; font-size: 11px; margin: 0 10px;">Discord</a>
       </div>
       <p style="font-size: 10px; color: #444; margin: 0; line-height: 1.5;">
         <a href="https://worldmonitor.app" style="color: #4ade80; text-decoration: none;">worldmonitor.app</a>
@@ -1253,31 +1254,6 @@ function truncateTelegramHtml(html, limit = TELEGRAM_MAX_LEN) {
   const lastNewline = truncated.lastIndexOf('\n');
   const cutPoint = lastNewline > limit * 0.6 ? lastNewline : truncated.length;
   return sanitizeTelegramHtml(truncated.slice(0, cutPoint) + '\n\n[truncated]');
-}
-
-/**
- * Phase 8: derive the 3 carousel image URLs from a signed magazine
- * URL. The HMAC token binds (userId, issueSlot), not the path — so
- * the same token verifies against /api/brief/{u}/{slot}?t=T AND against
- * /api/brief/carousel/{u}/{slot}/{0|1|2}?t=T.
- *
- * Returns null when the magazine URL doesn't match the expected shape
- * — caller falls back to text-only delivery.
- */
-function carouselUrlsFrom(magazineUrl) {
-  try {
-    const u = new URL(magazineUrl);
-    const m = u.pathname.match(/^\/api\/brief\/([^/]+)\/(\d{4}-\d{2}-\d{2}-\d{4})\/?$/);
-    if (!m) return null;
-    const [, userId, issueSlot] = m;
-    const token = u.searchParams.get('t');
-    if (!token) return null;
-    return [0, 1, 2].map(
-      (p) => `${u.origin}/api/brief/carousel/${userId}/${issueSlot}/${p}?t=${token}`,
-    );
-  } catch {
-    return null;
-  }
 }
 
 /**
@@ -1663,7 +1639,11 @@ async function composeBriefsForRun(rules, nowMs) {
   // was far worse than a brief with dashes on the stats page.)
   let insightsNumbers = { clusters: 0, multiSource: 0 };
   try {
-    const insightsRaw = await readRawJsonFromUpstash(INSIGHTS_KEY);
+    // raw = true pins the bare-key read (#7674): the seeder fleet publishes
+    // bare rows and must keep doing so even if VERCEL_ENV ever leaks into
+    // this container's runtime. The api readers of this key are hard-locked
+    // raw too (api/latest-brief.ts and the brief routes).
+    const insightsRaw = await readRawJsonFromUpstash(INSIGHTS_KEY, 3_000, true);
     if (insightsRaw) insightsNumbers = extractInsights(insightsRaw).numbers;
   } catch (err) {
     console.warn('[digest] brief: insights read failed, using zeroed stats:', err.message);
@@ -2137,10 +2117,13 @@ async function composeAndStoreBriefForUser(userId, annotated, insightsNumbers, d
   // One SET per compose is cheap and always current.
   const latestPointerKey = `brief:latest:${userId}`;
   const latestPointerValue = JSON.stringify({ issueSlot });
+  // raw = true pins the bare-key write (#7674): the digest composer publishes
+  // the envelopes every api/brief reader resolves raw; see the insights read
+  // above for the VERCEL_ENV-leak rationale.
   const pipelineResult = await redisPipeline([
     ['SETEX', key, String(BRIEF_TTL_SECONDS), JSON.stringify(finalEnvelope)],
     ['SETEX', latestPointerKey, String(BRIEF_TTL_SECONDS), latestPointerValue],
-  ]);
+  ], 5_000, true);
   if (!pipelineResult || !Array.isArray(pipelineResult) || pipelineResult.length < 2) {
     throw new Error('null pipeline response from Upstash');
   }
@@ -2408,7 +2391,10 @@ async function main() {
     }
 
     const ruleChannelSet = new Set(rule.channels ?? []);
-    const deliverableChannels = channels.filter(ch => ruleChannelSet.has(ch.channelType) && ch.verified);
+    const deliverableChannels = channels.filter(ch =>
+      ruleChannelSet.has(ch.channelType) && ch.verified &&
+      (ch.channelType !== 'email' || ch.emailOwnership === 'verified_account') &&
+      (ch.channelType !== 'telegram' || ch.telegramOwnership === 'verified_callback'));
     if (deliverableChannels.length === 0) {
       console.log(`[digest] No deliverable channels for ${rule.userId} — skipping`);
       continue;
